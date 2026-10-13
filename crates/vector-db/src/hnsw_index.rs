@@ -1,7 +1,9 @@
-use std::collections::BinaryHeap;
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 type PointId = usize;
-type Dist = f32;
+
+#[derive(Debug, Clone, Copy, PartialEq , PartialOrd)]
+struct Dist(f32);
 
 struct HnswIndex {
     dim: usize,
@@ -11,8 +13,8 @@ struct HnswIndex {
     params: HnswParameters,
 
     visited_list: VisitedList,
-    candidates: BinaryHeap<(f32, PointId)>,
-    results: BinaryHeap<(f32, PointId)>,
+    candidates: BinaryHeap<Reverse<(Dist, PointId)>>,
+    results: BinaryHeap<(Dist, PointId)>,
 }
 
 struct HnswParameters {
@@ -46,8 +48,15 @@ impl HnswIndex {
         for &id in ep {
             self.visited_list.insert(id);
             let d = self.dist( q, id);
-            
+            self.candidates.push(Reverse((d, id)));
+            self.results.push((d,id));
         }
+
+        while let Some(Reverse((dc, candidate))) = self.candidates.pop() {
+            let &(df, f) = self.results.peek().unwrap();
+            if dc < df {break}
+        }
+
         todo!()
     }
     
@@ -79,6 +88,21 @@ impl VisitedList {
     pub fn insert(&mut self, q: PointId) -> bool {
         let mark = &mut self.marks[q];
         if *mark == self.epoch { false } else { *mark = self.epoch; true }
+    }
+}
+
+
+impl Dist {
+    fn new(d: f32) -> Self {
+        if d.is_nan() { panic!("tried to build a NaN distance") } else { Self(d) }
+    }
+}
+
+impl Eq for Dist {}
+
+impl Ord for Dist {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
     }
 }
 
