@@ -9,7 +9,7 @@ struct HnswIndex {
     dim: usize,
     entry_point: Option<PointId>,
     vectors: Vec<Vec<f32>>,
-    layers: Vec<Vec<PointId>>,
+    layers: Vec<Vec<Vec<PointId>>>,
     params: HnswParameters,
 
     visited_list: VisitedList,
@@ -40,7 +40,7 @@ impl HnswIndex {
         }
     }
 
-    fn search_layer(&mut self, q : PointId, ep: &[PointId], _ef: usize, _lc: usize) -> Vec<PointId> {
+    fn search_layer(&mut self, q : PointId, ep: &[PointId], ef: usize, lc: usize) -> () {
         self.visited_list.reset(self.vectors.len());
         self.candidates.clear();
         self.results.clear();
@@ -52,12 +52,24 @@ impl HnswIndex {
             self.results.push((d,id));
         }
 
-        while let Some(Reverse((dc, candidate))) = self.candidates.pop() {
-            let &(df, f) = self.results.peek().unwrap();
-            if dc < df {break}
+        while let Some(Reverse((dc, c))) = self.candidates.pop() {
+            let &(df, _) = self.results.peek().unwrap();
+            if dc >= df {
+                for &e in &self.layers[lc][c] {
+                    if self.visited_list.insert(e) {
+                        let &(df, _) = self.results.peek().unwrap();
+                        let de = self.dist(e, q);
+                        if de < df || self.results.len() < ef {
+                            self.candidates.push(Reverse((de, e)));
+                            self.results.push((de, e));
+                            if self.results.len() > ef {
+                                self.results.pop().unwrap();
+                            }
+                        }
+                    }
+                }
+            }
         }
-
-        todo!()
     }
     
     fn dist(&self, _x: PointId, _y: PointId) -> Dist {
