@@ -1,4 +1,6 @@
-use std::{cmp::Reverse, collections::BinaryHeap};
+use std::{cmp::{Reverse, min}, collections::BinaryHeap};
+
+use rand::RngExt;
 
 type PointId = usize;
 
@@ -7,21 +9,22 @@ struct Dist(f32);
 
 struct HnswIndex {
     dim: usize,
-    entry_point: Option<PointId>,
+    entry_point: Option<(PointId, usize)>,
     vectors: Vec<Vec<f32>>,
-    layers: Vec<Vec<Vec<PointId>>>,
+    layers: Vec<Vec<BinaryHeap<(Dist, PointId)>>>,
     params: HnswParameters,
 
     visited_list: VisitedList,
     candidates: BinaryHeap<Reverse<(Dist, PointId)>>,
     results: BinaryHeap<(Dist, PointId)>,
+    rng: rand::rngs::StdRng,
 }
 
 struct HnswParameters {
-    ef_construction: bool,
-    m: bool,
-    m_max: bool,
-    ml: bool,
+    ef_construction: usize,
+    m: usize,
+    m_max: usize,
+    ml: f64,
 }
 
 impl HnswIndex {
@@ -30,13 +33,61 @@ impl HnswIndex {
     }
     pub fn insert(&mut self, q : Vec<f32>) -> Result<(), HnswError> {
         if q.len() != self.dim {
-            Err(HnswError::DimensionMismatch{expected: self.dim, actual: q.len()})
-        } else {
-            let id = self.vectors.len();
-            self.vectors.push(q);
-
+            return Err(HnswError::DimensionMismatch{expected: self.dim, actual: q.len()})
+        }
+        let id = self.vectors.len();
+        self.vectors.push(q);
+        
+        let l = {
+            let u = 1.0 - self.rng.random::<f64>();
+            (- u.ln() * self.params.ml).floor() as usize
+        };
+        
+        for layer in &mut self.layers {
+            layer.push(BinaryHeap::new());
+        }
+        for _ in self.layers.len()..=l {
+            self.layers.push(vec![BinaryHeap::new(); id + 1]);
+        }
+        
+        if let Some((e, height)) = self.entry_point {
+            let mut ep = vec!(e);
             
-            todo!()
+            // mutate ep to be the nearest point in layers above l to q.
+            for lc in (l + 1..=height).rev() {
+                self.search_layer(id, &ep, 1, lc);
+                let (_, new) = self.results
+                    .pop()
+                    .expect("expected layer to return vector"); 
+                ep = vec!(new);
+
+            }
+            
+            // insert bidi connections in lower levels to efconstruction nearest elements and shrink connections.
+            for lc in (0..=min(l, height)).rev() {
+                self.search_layer(id, &ep, self.params.ef_construction, lc);
+                ep = self.results.iter().map(|&(_, e)| e).collect();
+                
+                let neighbours = self.select_neighbors(self.params.m);
+                for &(d, e) in &neighbours {
+                    self.layers[lc][e].push((d,id));
+                    self.layers[lc][id].push((d,e));
+                }
+                for &(_, e) in &neighbours {
+                    while self.layers[lc][e].len() > self.params.m_max {
+                        self.layers[lc][e].pop();
+                    };
+                }
+            }
+            
+            // update the index entrypoint if l is higher than the height before insert.
+            if l > height {
+                self.entry_point = Some((id, l));
+            }
+            Ok(())
+        } else {
+            self.entry_point = Some((id, l));
+            Ok(())
         }
     }
 
@@ -55,7 +106,7 @@ impl HnswIndex {
         while let Some(Reverse((dc, c))) = self.candidates.pop() {
             let &(df, _) = self.results.peek().unwrap();
             if dc >= df {
-                for &e in &self.layers[lc][c] {
+                for &(_, e) in &self.layers[lc][c] {
                     if self.visited_list.insert(e) {
                         let &(df, _) = self.results.peek().unwrap();
                         let de = self.dist(e, q);
@@ -71,10 +122,18 @@ impl HnswIndex {
             }
         }
     }
+
+    fn select_neighbors(&mut self, m: usize) -> Vec<(Dist, PointId)> {
+        while self.results.len() > m {
+            self.results.pop();
+        };
+        self.results.iter().copied().collect()
+    }
     
     fn dist(&self, _x: PointId, _y: PointId) -> Dist {
         todo!()
     }
+
 }
 
 
