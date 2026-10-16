@@ -1,18 +1,23 @@
-use std::{cmp::{Reverse, min}, collections::BinaryHeap};
+use std::{
+    cmp::{Reverse, min},
+    collections::BinaryHeap,
+};
 
 use rand::RngExt;
 
 type PointId = usize;
 
-#[derive(Debug, Clone, Copy, PartialEq , PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 struct Dist(f32);
 
-struct HnswIndex {
-    dim: usize,
-    entry_point: Option<(PointId, usize)>,
-    vectors: Vec<Vec<f32>>,
-    layers: Vec<Vec<BinaryHeap<(Dist, PointId)>>>,
+struct HnswIndex<S: SelectNeighbours<V>, V: VectorStore> {
     params: HnswParameters,
+
+    store: V,
+    layers: Vec<Vec<Vec<(Dist, PointId)>>>,
+    selector: S,
+
+    entry_point: Option<(PointId, usize)>,
 
     visited_list: VisitedList,
     candidates: BinaryHeap<Reverse<(Dist, PointId)>>,
@@ -24,62 +29,80 @@ struct HnswParameters {
     ef_construction: usize,
     m: usize,
     m_max: usize,
+    m_max0: usize,
     ml: f64,
 }
 
-impl HnswIndex {
+impl<S: SelectNeighbours<V>, V: VectorStore> HnswIndex<S, V> {
     pub fn new() -> Self {
         todo!()
     }
-    pub fn insert(&mut self, q : Vec<f32>) -> Result<(), HnswError> {
-        if q.len() != self.dim {
-            return Err(HnswError::DimensionMismatch{expected: self.dim, actual: q.len()})
+
+    pub fn insert(&mut self, q: Vec<f32>) -> Result<(), HnswError> {
+        if q.len() != self.store.dim() {
+            return Err(HnswError::DimensionMismatch {
+                expected: self.store.dim(),
+                actual: q.len(),
+            });
         }
-        let id = self.vectors.len();
-        self.vectors.push(q);
-        
+        let id = self.store.insert(q);
+
         let l = {
             let u = 1.0 - self.rng.random::<f64>();
-            (- u.ln() * self.params.ml).floor() as usize
+            (-u.ln() * self.params.ml).floor() as usize
         };
-        
+
         for layer in &mut self.layers {
-            layer.push(BinaryHeap::new());
+            layer.push(Vec::new());
         }
         for _ in self.layers.len()..=l {
-            self.layers.push(vec![BinaryHeap::new(); id + 1]);
+            self.layers.push(vec![Vec::new(); id + 1]);
         }
-        
+
         if let Some((e, height)) = self.entry_point {
-            let mut ep = vec!(e);
-            
-            // mutate ep to be the nearest point in layers above l to q.
+            let mut ep = vec![e];
+
             for lc in (l + 1..=height).rev() {
                 self.search_layer(id, &ep, 1, lc);
-                let (_, new) = self.results
-                    .pop()
-                    .expect("expected layer to return vector"); 
-                ep = vec!(new);
-
+                let (_, new) = self.results.pop().expect("expected layer to return vector");
+                ep = vec![new];
             }
-            
-            // insert bidi connections in lower levels to efconstruction nearest elements and shrink connections.
+
             for lc in (0..=min(l, height)).rev() {
                 self.search_layer(id, &ep, self.params.ef_construction, lc);
-                ep = self.results.iter().map(|&(_, e)| e).collect();
-                
-                let neighbours = self.select_neighbors(self.params.m);
+
+                let neighbours = self.selector.select(
+                    id,
+                    self.results.as_slice(),
+                    self.params.m,
+                    &self.store,
+                    &self.layers[lc],
+                );
                 for &(d, e) in &neighbours {
-                    self.layers[lc][e].push((d,id));
-                    self.layers[lc][id].push((d,e));
+                    self.layers[lc][e].push((d, id));
+                    self.layers[lc][id].push((d, e));
                 }
+
+                let m_max = match lc {
+                    0 => self.params.m_max0,
+                    _ => self.params.m_max,
+                };
                 for &(_, e) in &neighbours {
-                    while self.layers[lc][e].len() > self.params.m_max {
-                        self.layers[lc][e].pop();
-                    };
+                    
+                    if self.layers[lc][e].len() > m_max {
+                        self.layers[lc][e] = self.selector.select(
+                            e,
+                            &self.layers[lc][e],
+                            m_max,
+                            &self.store,
+                            &self.layers[lc],
+                        );
+                    }
                 }
+
+                ep = self.results.iter().map(|&(_, e)| e).collect();
             }
-            
+
             // update the index entrypoint if l is higher than the height before insert.
             if l > height {
                 self.entry_point = Some((id, l));
@@ -91,31 +114,32 @@ impl HnswIndex {
         }
     }
 
-    fn search_layer(&mut self, q : PointId, ep: &[PointId], ef: usize, lc: usize) -> () {
-        self.visited_list.reset(self.vectors.len());
+    fn search_layer(&mut self, q: PointId, ep: &[PointId], ef: usize, lc: usize) -> () {
+        self.visited_list.reset(self.store.len());
         self.candidates.clear();
         self.results.clear();
-        
+
         for &id in ep {
             self.visited_list.insert(id);
-            let d = self.dist( q, id);
+            let d = self.store.dist(q, id);
             self.candidates.push(Reverse((d, id)));
-            self.results.push((d,id));
+            self.results.push((d, id));
         }
 
         while let Some(Reverse((dc, c))) = self.candidates.pop() {
             let &(df, _) = self.results.peek().unwrap();
-            if dc >= df {
-                for &(_, e) in &self.layers[lc][c] {
-                    if self.visited_list.insert(e) {
-                        let &(df, _) = self.results.peek().unwrap();
-                        let de = self.dist(e, q);
-                        if de < df || self.results.len() < ef {
-                            self.candidates.push(Reverse((de, e)));
-                            self.results.push((de, e));
-                            if self.results.len() > ef {
-                                self.results.pop().unwrap();
-                            }
+            if dc > df {
+                break;
+            }
+            for &(_, e) in &self.layers[lc][c] {
+                if self.visited_list.insert(e) {
+                    let &(df, _) = self.results.peek().unwrap();
+                    let de = self.store.dist(e, q);
+                    if de < df || self.results.len() < ef {
+                        self.candidates.push(Reverse((de, e)));
+                        self.results.push((de, e));
+                        if self.results.len() > ef {
+                            self.results.pop().unwrap();
                         }
                     }
                 }
@@ -123,28 +147,24 @@ impl HnswIndex {
         }
     }
 
-    fn select_neighbors(&mut self, m: usize) -> Vec<(Dist, PointId)> {
-        while self.results.len() > m {
-            self.results.pop();
-        };
-        self.results.iter().copied().collect()
+    fn k_nn_search(&self, q: &[f32], k: usize, ef: usize ) {
+        todo!() // we'll need to deal with the fact that searchlayer only accepts pointId's
     }
-    
-    fn dist(&self, _x: PointId, _y: PointId) -> Dist {
-        todo!()
-    }
-
 }
-
 
 struct VisitedList {
     marks: Vec<u16>,
-    epoch: u16
+    epoch: u16,
 }
 
 impl VisitedList {
-    pub fn new() -> Self { Self { marks: Vec::new(), epoch: 0,} }
-    
+    pub fn new() -> Self {
+        Self {
+            marks: Vec::new(),
+            epoch: 0,
+        }
+    }
+
     pub fn reset(&mut self, n: usize) {
         if self.marks.len() < n {
             self.marks.resize(n, 0)
@@ -158,14 +178,22 @@ impl VisitedList {
 
     pub fn insert(&mut self, q: PointId) -> bool {
         let mark = &mut self.marks[q];
-        if *mark == self.epoch { false } else { *mark = self.epoch; true }
+        if *mark == self.epoch {
+            false
+        } else {
+            *mark = self.epoch;
+            true
+        }
     }
 }
 
-
 impl Dist {
     fn new(d: f32) -> Self {
-        if d.is_nan() { panic!("tried to build a NaN distance") } else { Self(d) }
+        if d.is_nan() {
+            panic!("tried to build a NaN distance")
+        } else {
+            Self(d)
+        }
     }
 }
 
@@ -177,20 +205,94 @@ impl Ord for Dist {
     }
 }
 
+trait SelectNeighbours<V: VectorStore> {
+    fn select(
+        &self,
+        q: PointId,
+        candidates: &[(Dist, PointId)],
+        m: usize,
+        store: &V,
+        layer: &[Vec<(Dist, PointId)>],
+    ) -> Vec<(Dist, PointId)>;
+}
+
+struct SelectNeighboursSimple;
+impl<V: VectorStore> SelectNeighbours<V> for SelectNeighboursSimple {
+    fn select(
+        &self,
+        _q: PointId,
+        candidates: &[(Dist, PointId)],
+        m: usize,
+        _store: &V,
+        _layer: &[Vec<(Dist, PointId)>],
+    ) -> Vec<(Dist, PointId)> {
+        let mut neighbours = candidates.to_vec();
+        if neighbours.len() > m {
+            neighbours.select_nth_unstable(m);
+            neighbours.truncate(m);
+        }
+        neighbours
+    }
+}
+
+trait VectorStore {
+    fn dim(&self) -> usize;
+    fn len(&self) -> usize;
+    fn insert(&mut self, v: Vec<f32>) -> PointId;
+    fn dist(&self, a: PointId, b: PointId) -> Dist;
+}
+
+trait Metric {
+    fn dist(&self, _: &[f32], _: &[f32]) -> Dist;
+}
+
+/// Keeps every vector in memory; a vector's id is its position in `vectors`.
+struct InMemoryStore<M: Metric> {
+    dim: usize,
+    vectors: Vec<Vec<f32>>,
+    metric: M,
+}
+
+impl<M: Metric> InMemoryStore<M> {
+    pub fn new(dim: usize, metric: M) -> Self {
+        Self {
+            dim,
+            vectors: Vec::new(),
+            metric,
+        }
+    }
+}
+
+impl<M: Metric> VectorStore for InMemoryStore<M> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn len(&self) -> usize {
+        self.vectors.len()
+    }
+
+    fn insert(&mut self, v: Vec<f32>) -> PointId {
+        let id = self.vectors.len();
+        self.vectors.push(v);
+        id
+    }
+
+    fn dist(&self, a: PointId, b: PointId) -> Dist {
+        self.metric.dist(&self.vectors[a], &self.vectors[b])
+    }
+}
 
 #[derive(Debug)]
 pub enum HnswError {
-    DimensionMismatch {
-        expected: usize,
-        actual: usize,
-    }
+    DimensionMismatch { expected: usize, actual: usize },
 }
 
 impl std::fmt::Display for HnswError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HnswError::DimensionMismatch { expected, actual } => {
-                write! (f, "dimension mismatch: expected {expected}, got {actual}")
+                write!(f, "dimension mismatch: expected {expected}, got {actual}")
             }
         }
     }
