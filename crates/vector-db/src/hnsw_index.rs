@@ -45,7 +45,7 @@ impl<S: SelectNeighbours<V>, V: VectorStore> HnswIndex<S, V> {
                 actual: q.len(),
             });
         }
-        let id = self.store.insert(q);
+        let id = self.store.push(q);
 
         let l = {
             let u = 1.0 - self.rng.random::<f64>();
@@ -147,8 +147,33 @@ impl<S: SelectNeighbours<V>, V: VectorStore> HnswIndex<S, V> {
         }
     }
 
-    fn k_nn_search(&self, q: &[f32], k: usize, ef: usize ) {
-        todo!() // we'll need to deal with the fact that searchlayer only accepts pointId's
+    fn k_nn_search(&mut self, q: Vec<f32>, k: usize, ef: usize) -> Result<Vec<(Dist, PointId)>, HnswError> {
+        if q.len() != self.store.dim() {
+            return Err(HnswError::DimensionMismatch {
+                expected: self.store.dim(),
+                actual: q.len(),
+            });
+        }
+        let Some((e, h)) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        let id = self.store.push(q);
+
+        let mut ep = vec![e];
+        for lc in (1..=h).rev() {
+            self.search_layer(id, &ep, 1, lc);
+            let &(_, nearest) = self.results.peek().expect("expected layer to return vector");
+            ep[0] = nearest;
+        }
+        self.search_layer(id, &ep, ef.max(k), 0);
+
+        let mut nearest = self.results.as_slice().to_vec();
+        nearest.sort_unstable();
+        nearest.truncate(k);
+
+        self.store.pop();
+        Ok(nearest)
     }
 }
 
@@ -235,10 +260,37 @@ impl<V: VectorStore> SelectNeighbours<V> for SelectNeighboursSimple {
     }
 }
 
+struct SelectNeighboursHeuristic {
+    extend_candidates: bool,
+    keep_pruned_connections: bool,
+}
+
+impl<V: VectorStore> SelectNeighbours<V> for SelectNeighboursHeuristic {
+    fn select(
+        &self,
+        q: PointId,
+        candidates: &[(Dist, PointId)],
+        m: usize,
+        store: &V,
+        layer: &[Vec<(Dist, PointId)>],
+    ) -> Vec<(Dist, PointId)> {
+        if self.extend_candidates {
+            for &(d, c) in candidates {
+                for &adj in &layer[c] {
+                    
+                }
+            }
+        }
+        todo!()
+    }
+}
+
 trait VectorStore {
     fn dim(&self) -> usize;
     fn len(&self) -> usize;
-    fn insert(&mut self, v: Vec<f32>) -> PointId;
+    fn push(&mut self, v: Vec<f32>) -> PointId;
+    fn pop(&mut self) -> Option<Vec<f32>>;
+    fn get(&self, i: PointId) -> Option<&Vec<f32>>;
     fn dist(&self, a: PointId, b: PointId) -> Dist;
 }
 
@@ -272,10 +324,18 @@ impl<M: Metric> VectorStore for InMemoryStore<M> {
         self.vectors.len()
     }
 
-    fn insert(&mut self, v: Vec<f32>) -> PointId {
+    fn push(&mut self, v: Vec<f32>) -> PointId {
         let id = self.vectors.len();
         self.vectors.push(v);
         id
+    }
+
+    fn pop(&mut self) -> Option<Vec<f32>> {
+        self.vectors.pop()
+    }
+
+    fn get(&self, id: PointId) -> Option<&Vec<f32>> {
+        self.vectors.get(id)
     }
 
     fn dist(&self, a: PointId, b: PointId) -> Dist {
