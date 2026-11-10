@@ -1,6 +1,5 @@
 use std::{
-    cmp::{Reverse, min},
-    collections::BinaryHeap,
+    cmp::{Reverse, min}, collections::BinaryHeap,
 };
 
 use rand::RngExt;
@@ -234,7 +233,7 @@ trait SelectNeighbours<V: VectorStore> {
     fn select(
         &self,
         q: PointId,
-        candidates: &[(Dist, PointId)],
+        candidates: &[(Dist, PointId)], // Distance is the 
         m: usize,
         store: &V,
         layer: &[Vec<(Dist, PointId)>],
@@ -274,14 +273,49 @@ impl<V: VectorStore> SelectNeighbours<V> for SelectNeighboursHeuristic {
         store: &V,
         layer: &[Vec<(Dist, PointId)>],
     ) -> Vec<(Dist, PointId)> {
-        if self.extend_candidates {
-            for &(d, c) in candidates {
-                for &adj in &layer[c] {
-                    
+        
+        let w = if self.extend_candidates {
+            let mut extended : Vec<usize> = Vec::with_capacity(candidates.len() * m);
+            for &(_, c) in candidates {
+                for &(_, ea) in &layer[c] {
+                    if ea != q {
+                        extended.push(ea);
+                    }
                 }
             }
+            extended.sort_unstable();
+            extended.dedup();
+            let mut w : Vec<(Dist, PointId)> = Vec::with_capacity(extended.len() + candidates.len());
+            w.extend(extended.iter().map(|&p| (store.dist(p, q), p)));
+            w.extend(candidates.iter());
+            w.sort_unstable();
+            w.dedup();
+            w
+        } else {
+            let mut w = candidates.to_vec();
+            w.sort_unstable();
+            w
+        };
+
+        let mut r: Vec<(Dist, PointId)> = Vec::with_capacity(m);
+        let mut wd: Vec<(Dist, PointId)> = Vec::new();
+
+        for (d, p) in w {
+            if r.len() >= m {
+                break;
+            }
+            if r.iter().all(|&(_, rp)| d < store.dist(p, rp)) {
+                r.push((d, p));
+            } else if self.keep_pruned_connections {
+                wd.push((d, p));
+            }
         }
-        todo!()
+
+        if self.keep_pruned_connections {
+            let room = m.saturating_sub(r.len());
+            r.extend(wd.into_iter().take(room));
+        }
+        r
     }
 }
 
